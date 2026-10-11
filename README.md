@@ -1,153 +1,73 @@
-# Clerkstone - FHIR Clinical Record & Data Quality Platform
+Live demo: https://clerk.excelemma.site/
 
-> **Portfolio prototype. All patient data is synthetic. Not NHS-approved, not
-> clinically validated, and must not be used for patient care.**
+All patient data here is synthetic. This is a personal concept project. It has no NHS approval, no clinical validation, and it must not be used for patient care.
 
-**[Architecture](docs/architecture.md) · [Hazard log](docs/Hazard_Log.md)
-· [Data-quality defect taxonomy](docs/DEFECT_TAXONOMY.md) · [API guide](docs/API_GUIDE.md)**
+The problem
 
-Clerkstone ingests synthetic FHIR R4 patient records, validates them against HL7
-FHIR UK Core profiles, stores them in a hybrid relational/JSONB PostgreSQL
-schema, and exposes a governed REST API and React clinical timeline, plus a
-deterministic data quality gateway that detects and reports the kinds of defects
-that break real EPR migrations.
+NHS trusts move from one patient record system to another fairly often. Updates, changes, and sometimes two trusts merge. When that happens they inherit data they can't fully trust. NHS numbers go missing. Discharge dates land before admission dates. IDs get duplicated. Local codes map to nothing. Those errors then follow the data into the live system.
 
-## 1. The healthcare problem
+I found this while researching healthcare data for ML projects. NHS workers talk about it a lot. I wanted to see how I would catch those errors before they get anywhere near a live system, so I built this.
 
-NHS Trusts migrating to a new Electronic Patient Record (EPR) system often inherit data they cannot immediately trust. Incoming records frequently contain missing NHS numbers, impossible date sequences (like a discharge happening before an admission), duplicate identifiers, unmappable local codes, and physiological observations outside of survivable ranges. 
+What it does
 
-Handling these data quality issues (ensuring EPR data is accurate, validated, and trusted) is a massive, often under-appreciated challenge in healthcare interoperability. Clerkstone was built to simulate both the interoperability pipelines and the strict data-quality enforcement required to solve this, end to end, using synthetic data.
+	•	Takes in FHIR R4 bundles, skips duplicates by logical id, and stores every resource
+	•	Checks structure with fhir.resources, then checks UK Core profiles with the HL7 FHIR Validator running in its own container
+	•	Runs 65 data quality rules across 9 categories: required fields, identifiers, references, dates, physiological ranges, terminology, duplicates, cohort and structure
+	•	Reports every defect with a rule ID, a severity and the FHIRPath location
+	•	Serves the data through a REST API with FHIR search, $validate and $export, and converts HL7 v2 ADT messages
+	•	Shows a patient timeline in a React UI built with the NHS.UK design system, using the NHS frontend MCP server I built earlier
+	•	Logs every read and write in an append-only audit log, with each entry hash-chained using SHA-256
+	•	Locks things down with JWT (RS256) auth, roles and field level access
 
-## 2. What I built
+Stack
 
-- **Ingest:** `POST /fhir` accepts a FHIR Bundle (transaction), parses,
-  de-duplicates by logical id, and stores resources.
-- **Validate:** structural validation via `fhir.resources` Pydantic models, then
-  profile validation against UK Core through a validator sidecar.
-- **Store:** PostgreSQL: a JSONB `fhir_resource` source-of-truth table plus
-  indexed relational projections for patient, encounter, observation, condition,
-  and medication request.
-- **Assess:** a deterministic data-quality rule engine across nine categories
-  (required, identifier, referential, temporal, physiological, terminology,
-  duplication, cohort, structural).
-- **Serve:** a versioned REST API with FHIR-native `OperationOutcome` errors and
-  FHIR search semantics (`_id`, `_lastUpdated`, `patient`, `code`, `date`,
-  `_count`, `_include`) plus `$validate`, `$export` and an HL7 v2 ADT converter.
-- **Govern:** JWT (RS256) auth, role-based + field-level authorisation, and an
-  append-only SHA-256 hash-chained audit log covering reads as well as writes.
+	•	FastAPI and Pydantic v2 for the API
+	•	PostgreSQL 16 for storage. Raw FHIR sits in a JSONB table, and indexed tables hold patients, encounters, observations, conditions and medication requests
+	•	fhir.resources for the R4 models
+	•	HL7 FHIR Validator as a sidecar container
+	•	Next.js 15 and TypeScript for the UI
 
-## 3. Headline results
+Numbers
 
-| Metric | Value |
-|---|---|
-| Synthetic patients (committed fixture) | 20 (generatable to 500 via `make synth`) |
-| FHIR resource types ingested | 13 (Patient, Encounter, Observation, Condition, MedicationRequest, + 8 more) |
-| Data-quality rules implemented | 65 across 9 categories |
-| Rule test coverage | positive + negative + boundary per rule |
-| Golden-file defect fixtures | 48 (with committed exact expected reports) |
-| Backend tests | 91 (85% line coverage) |
-| axe-core serious violations | 0 |
+	•	20 synthetic patients in the committed fixture, up to 500 with make synth
+	•	13 FHIR resource types
+	•	65 rules, each with a passing, a failing and a boundary test
+	•	48 defect fixtures with exact expected reports
+	•	91 backend tests at 85% line coverage
+	•	0 serious axe-core violations
 
-## 4. Architecture
+The data comes from Synthea. A script (scripts/corrupt.py) then breaks it on purpose using seeds saved in data/fixtures/manifest.json, so every run gives the same defects.
 
-See [docs/architecture.md](docs/architecture.md) for the Mermaid diagram and the
-full rationale. The short version: a **modular monolith** (FastAPI + Next.js +
-PostgreSQL) with a heavyweight FHIR validator isolated in a sidecar container,
-and a pluggable terminology adapter so a local cached subset can be swapped for
-the live NHS England Terminology Server without touching business logic.
+Run it locally
 
-## 5. Technologies & why
+brew install openjdk@17                   # Synthea and the validator need Java 17
+make install                              # uv sync
+make up                                   # start Postgres with docker compose
+make migrate                              # apply Alembic migrations
+make synth && make corrupt && make load   # generate, corrupt and load the data
+make dev                                  # API on :8000
 
-| Tech | Used for | Why not the alternative |
-|---|---|---|
-| FastAPI + Pydantic v2 | REST API | Async, auto-OpenAPI, strict contracts |
-| PostgreSQL 16 (JSONB + relational) | Storage | FHIR is document-shaped; projections give indexed queries |
-| `fhir.resources` | FHIR R4 models | Pydantic-backed parse/serialise + structural validation |
-| HL7 FHIR Validator (sidecar) | UK Core profile validation | The reference implementation |
-| Next.js 15 + TypeScript | UI | React/TS is the core NHS frontend stack |
-| NHS.UK Design System | UI chrome | The approved NHS pattern |
-| JWT (RS256) + RBAC | Auth | Demonstrates token/claim/scope understanding |
+Tests run with make test. To check the audit log chain, run make verify-audit.
 
-## 6. Clinical data & interoperability
+Limits
 
-FHIR R4, UK Core profiles, SNOMED CT, dm+d, ICD-10, HL7 v2 ADT, and the NHS
-Number modulus-11 check digit. See [DATA_LICENCES.md](docs/DATA_LICENCES.md) for
-provenance and [HL7V2_MAPPING.md](docs/HL7V2_MAPPING.md) for the converter.
+	•	UK Core is a work in progress from NHS England and is marked not for implementation. My profile checks are a best effort. The validator version is pinned and shown in every report.
+	•	The SNOMED CT and dm+d mapping table is small and hand checked. Don't treat it as an official NHS mapping.
+	•	The rule engine only catches the defects I thought of. Every report shows which ruleset version ran.
+	•	There is no ML in this project. Every check is a rule, and a model guessing what a rule already knows would add nothing. The reasoning is in docs/DECISIONS.md (ADR-002).
+	•	Terminology lookups use a local cached subset. The live NHS England Terminology Server needs an approved account. The adapter is ready to swap when I get one.
+	•	I'm not a registered Clinical Safety Officer, so there is no signed safety case. The safety docs follow DCB0129 as far as I could take them alone.
 
-## 7. The data-quality rule engine
+More docs
 
-The differentiator. See [docs/DEFECT_TAXONOMY.md](docs/DEFECT_TAXONOMY.md) for
-the full defect taxonomy with real-world causes. Every rule has a stable ID,
-severity, FHIRPath location, and positive + negative + boundary tests.
+	•	docs/architecture.md
+	•	docs/DEFECT_TAXONOMY.md
+	•	docs/API_GUIDE.md
+	•	docs/Hazard_Log.md
+	•	docs/THREAT_MODEL.md
+	•	docs/accessibility.md
+	•	docs/RUNBOOK.md
 
-## 8. Dataset & licences
+Data and licences
 
-All data is **synthetic**, generated by [Synthea](https://github.com/synthetichealth/synthea)
-(Apache-2.0) and then modified by the deterministic corruption harness in
-`scripts/corrupt.py` using seeds recorded in `data/fixtures/manifest.json`. No
-real patient data is present, stored, processed or transmitted.
-
-## 9. Testing
-
-`make test` runs unit, golden-file, API/integration, authorisation-matrix, and
-security tests. See [docs/architecture.md](docs/architecture.md) and the
-`backend/tests/` tree for the strategy.
-
-## 10. Security & governance
-
-RBAC, a hash-chained audit log (`make verify-audit`), a [threat model](docs/THREAT_MODEL.md),
-a [hazard log](docs/Hazard_Log.md), and a [DTAC self-assessment](docs/DTAC_self_assessment.md).
-
-## 11. Accessibility
-
-WCAG 2.2 AA, NHS Design System, axe-core in CI, screen-reader tested.
-See [docs/accessibility.md](docs/accessibility.md).
-
-## 12. Screenshots
-
-*(annotated screenshots: see docs)*
-
-## 13. Running it locally
-
-```bash
-brew install openjdk@17                # Synthea + validator need Java 17
-make install                           # uv sync
-make up                                # start Postgres via docker compose
-make migrate                           # apply Alembic migrations
-make synth && make corrupt && make load   # generate + corrupt + load the dataset
-make dev                               # run the API on :8000
-```
-
-## 14. Deployment
-
-See [docs/RUNBOOK.md](docs/RUNBOOK.md). The 20-patient fixture is deployed
-publicly with read-only demo credentials; larger generated datasets stay local.
-
-## 15. Limitations & what I'd do next
-
-- **FHIR UK Core is published by NHS England as a work in progress "not for
-  implementation".** My profiles are indicative; the validator package version is
-  pinned and stated in every report.
-- **My SNOMED CT / dm+d mapping table is illustrative** and hand-verified on a
-  small subset. It is not an official NHS mapping and must not be used clinically.
-- **The quality engine detects the defects it was designed to detect.** It has no
-  coverage guarantee against defects I did not anticipate. This is why the
-  ruleset is versioned and the report always states which version ran.
-- **I have deliberately not added a machine-learning model.** Every task here is
-  deterministic, and a classifier predicting what a rule engine already knows
-  would be decoration. See `docs/DECISIONS.md` ADR-002.
-- **Terminology resolution runs against a local cached subset**, not the live NHS
-  England Terminology Server, because system-to-system access requires an
-  approved account. The adapter interface is in place and tested against recorded
-  fixtures.
-
-## 16. Clinical safety & compliance
-
-DCB0129-informed artefacts are in `docs/`. A compliant Clinical Safety Case
-Report requires a registered Clinical Safety Officer's signature, which a
-portfolio project cannot have, and I say so explicitly.
-
-## 17. Design decisions
-
-See [docs/DECISIONS.md](docs/DECISIONS.md), including ADR-002, "why there is no
-ML in this project".
+Patient data comes from Synthea (Apache-2.0). No real patient data is stored, processed or sent anywhere. More on sources in docs/DATA_LICENCES.md.
